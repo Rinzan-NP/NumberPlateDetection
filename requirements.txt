@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+opencv-python
+pytesseract
+pillow
+numpy
+pydantic
+paddlepaddle
+paddleocr
+ultralytics
+easyocr
+torch
+torchvision

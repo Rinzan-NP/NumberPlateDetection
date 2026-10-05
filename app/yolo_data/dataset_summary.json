@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "total_images": 929,
+  "train_images": 743,
+  "val_images": 186,
+  "train_boxes": 760,
+  "val_boxes": 194,
+  "local_samples": 47,
+  "hf_samples": 882,
+  "yaml_path": "/Users/nprinzan/Desktop/Code/College/NumberPlateDetection/Backend/app/yolo_data/dataset.yaml",
+  "yolo_data_dir": "/Users/nprinzan/Desktop/Code/College/NumberPlateDetection/Backend/app/yolo_data"
+}

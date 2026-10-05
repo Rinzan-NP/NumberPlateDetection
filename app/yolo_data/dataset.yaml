@@ -1,0 +1,5 @@
+path: /Users/nprinzan/Desktop/Code/College/NumberPlateDetection/Backend/app/yolo_data
+train: images/train
+val: images/val
+names:
+  0: license_plate
