@@ -92,7 +92,11 @@ async def detect_number_plate_video(
                 raise HTTPException(status_code=404, detail=f"Sample video '{sample_name}' not found")
             input_video_path = str(sample_path)
         else:
-            raise HTTPException(status_code=400, detail="Either 'file' or 'sample_name' must be provided")
+            # Default to the primary road surveillance video
+            sample_path = SAMPLE_MEDIA_DIR / "road_surveillance_traffic.mp4"
+            if not sample_path.exists():
+                raise HTTPException(status_code=400, detail="Either 'file' or 'sample_name' must be provided")
+            input_video_path = str(sample_path)
 
         result = process_video(input_video_path, stride=max(1, min(stride, 6)))
         return VideoDetectionResponse(**result)
@@ -164,11 +168,20 @@ async def get_samples():
             pass
 
     for vid_file in sorted(SAMPLE_MEDIA_DIR.glob("*.mp4")):
-        sample_videos.append({
+        title = vid_file.stem.replace("_", " ").title()
+        is_primary = vid_file.name == "road_surveillance_traffic.mp4"
+        if is_primary:
+            title = "NH-48 Expressway Multi-Lane CCTV Stream"
+        item = {
             "name": vid_file.name,
-            "title": vid_file.stem.replace("_", " ").title(),
+            "title": title,
             "size_mb": round(vid_file.stat().st_size / (1024 * 1024), 2),
-        })
+            "is_primary": is_primary,
+        }
+        if is_primary:
+            sample_videos.insert(0, item)
+        else:
+            sample_videos.append(item)
 
     return {
         "images": sample_images,

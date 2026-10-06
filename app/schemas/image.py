@@ -37,6 +37,9 @@ class VideoPlateTrack(BaseModel):
     confidence: float
     detections_count: int
     thumbnail: str
+    lane: Optional[str] = None
+    vehicle_crop: Optional[str] = ""
+    speed_kmh: Optional[int] = None
 
 class VideoDetectionResponse(BaseModel):
     success: bool = True
