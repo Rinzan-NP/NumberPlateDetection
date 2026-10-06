@@ -43,42 +43,74 @@ class TrainingProgressCallback:
         self.history = []
 
     def on_train_epoch_end(self, trainer):
-        epoch = trainer.epoch + 1
-        metrics = trainer.metrics or {}
-        losses = trainer.loss_items.tolist() if hasattr(trainer, "loss_items") and trainer.loss_items is not None else []
-        
-        box_loss = losses[0] if len(losses) > 0 else 0.0
-        cls_loss = losses[1] if len(losses) > 1 else 0.0
-        dfl_loss = losses[2] if len(losses) > 2 else 0.0
+        try:
+            epoch = getattr(trainer, "epoch", 0) + 1
+            metrics = getattr(trainer, "metrics", {}) or {}
 
-        map50 = float(metrics.get("metrics/mAP50(B)", 0.0))
-        map50_95 = float(metrics.get("metrics/mAP50-95(B)", 0.0))
-        precision = float(metrics.get("metrics/precision(B)", 0.0))
-        recall = float(metrics.get("metrics/recall(B)", 0.0))
+            # In Ultralytics 8.4+, loss_items can be a dictionary, PyTorch tensor, or list
+            box_loss, cls_loss, dfl_loss = 0.0, 0.0, 0.0
+            loss_items = getattr(trainer, "loss_items", None)
+            if loss_items is None:
+                loss_items = getattr(trainer, "tloss", None)
 
-        record = {
-            "epoch": epoch,
-            "total_epochs": self.total_epochs,
-            "train_loss": round(box_loss + cls_loss + dfl_loss, 4),
-            "box_loss": round(box_loss, 4),
-            "cls_loss": round(cls_loss, 4),
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "map50": round(map50, 4),
-            "map50_95": round(map50_95, 4),
-            "timestamp": time.time(),
-        }
-        self.history.append(record)
+            if isinstance(loss_items, dict):
+                for k, v in loss_items.items():
+                    val = float(v.item() if hasattr(v, "item") else v)
+                    k_lower = str(k).lower()
+                    if "box" in k_lower:
+                        box_loss = val
+                    elif "cls" in k_lower:
+                        cls_loss = val
+                    elif "dfl" in k_lower:
+                        dfl_loss = val
+                # Fallback if key names differ
+                if box_loss == 0.0 and cls_loss == 0.0 and dfl_loss == 0.0 and loss_items:
+                    vals = [float(v.item() if hasattr(v, "item") else v) for v in loss_items.values()]
+                    box_loss = vals[0] if len(vals) > 0 else 0.0
+                    cls_loss = vals[1] if len(vals) > 1 else 0.0
+                    dfl_loss = vals[2] if len(vals) > 2 else 0.0
+            elif hasattr(loss_items, "tolist"):
+                vals = loss_items.tolist()
+                box_loss = float(vals[0]) if len(vals) > 0 else 0.0
+                cls_loss = float(vals[1]) if len(vals) > 1 else 0.0
+                dfl_loss = float(vals[2]) if len(vals) > 2 else 0.0
+            elif isinstance(loss_items, (list, tuple)):
+                vals = [float(x.item() if hasattr(x, "item") else x) for x in loss_items]
+                box_loss = vals[0] if len(vals) > 0 else 0.0
+                cls_loss = vals[1] if len(vals) > 1 else 0.0
+                dfl_loss = vals[2] if len(vals) > 2 else 0.0
 
-        update_status({
-            "status": "training",
-            "progress_percent": round((epoch / self.total_epochs) * 100, 1),
-            "current_epoch": epoch,
-            "total_epochs": self.total_epochs,
-            "latest_metrics": record,
-            "history": self.history[-30:],  # keep last 30 for visualization
-            "message": f"Training epoch {epoch}/{self.total_epochs} - mAP50: {map50:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}",
-        })
+            map50 = float(metrics.get("metrics/mAP50(B)", metrics.get("mAP50", 0.0)))
+            map50_95 = float(metrics.get("metrics/mAP50-95(B)", metrics.get("mAP50-95", 0.0)))
+            precision = float(metrics.get("metrics/precision(B)", metrics.get("precision", 0.0)))
+            recall = float(metrics.get("metrics/recall(B)", metrics.get("recall", 0.0)))
+
+            record = {
+                "epoch": epoch,
+                "total_epochs": self.total_epochs,
+                "train_loss": round(box_loss + cls_loss + dfl_loss, 4),
+                "box_loss": round(box_loss, 4),
+                "cls_loss": round(cls_loss, 4),
+                "dfl_loss": round(dfl_loss, 4),
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "map50": round(map50, 4),
+                "map50_95": round(map50_95, 4),
+                "timestamp": time.time(),
+            }
+            self.history.append(record)
+
+            update_status({
+                "status": "training",
+                "progress_percent": round((epoch / self.total_epochs) * 100, 1),
+                "current_epoch": epoch,
+                "total_epochs": self.total_epochs,
+                "latest_metrics": record,
+                "history": self.history[-30:],  # keep last 30 for visualization
+                "message": f"Training epoch {epoch}/{self.total_epochs} - mAP50: {map50:.3f}, Precision: {precision:.3f}, Recall: {recall:.3f}",
+            })
+        except Exception as cb_err:
+            print(f"Warning in TrainingProgressCallback: {cb_err}", file=sys.stderr)
 
 
 def get_default_device() -> str:
