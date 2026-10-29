@@ -31,7 +31,7 @@ _training_thread = None
 
 
 @router.post("/detect", response_model=ImageDetectionResponse)
-async def detect_number_plate(
+def detect_number_plate(
     file: Optional[UploadFile] = File(None),
     sample_name: Optional[str] = Form(None),
 ):
@@ -40,7 +40,7 @@ async def detect_number_plate(
     """
     try:
         if file is not None:
-            contents = await file.read()
+            contents = file.file.read()
         elif sample_name:
             sample_path = SAMPLE_MEDIA_DIR / sample_name
             if not sample_path.exists():
@@ -71,7 +71,7 @@ async def detect_number_plate(
 
 
 @router.post("/detect-video", response_model=VideoDetectionResponse)
-async def detect_number_plate_video(
+def detect_number_plate_video(
     file: Optional[UploadFile] = File(None),
     sample_name: Optional[str] = Form(None),
     stride: int = Form(3),
@@ -170,8 +170,11 @@ async def get_samples():
     for vid_file in sorted(SAMPLE_MEDIA_DIR.glob("*.mp4")):
         title = vid_file.stem.replace("_", " ").title()
         is_primary = vid_file.name == "road_surveillance_traffic.mp4"
+        is_euro = vid_file.name == "euro_highway_traffic.mp4"
         if is_primary:
             title = "NH-48 Expressway Multi-Lane CCTV Stream"
+        elif is_euro:
+            title = "European Highway Multi-Lane Surveillance (4K)"
         item = {
             "name": vid_file.name,
             "title": title,

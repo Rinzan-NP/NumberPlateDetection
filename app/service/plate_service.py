@@ -49,14 +49,17 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from paddleocr import PaddleOCR
 from ultralytics import YOLO
+import easyocr
 
 # ==============================================================================
 # Paths & Environment Configuration
 # ==============================================================================
 # Resolve absolute paths based on this file's location inside Backend/app/service/
 BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
-# Pretrained / fine-tuned YOLOv8 model weights for plate detection
-YOLO_MODEL_PATH = BACKEND_DIR / "app" / "yolo_data" / "plate_detector" / "weights" / "best.pt"
+# Pretrained / fine-tuned YOLOv11 model weights for high-accuracy license plate detection
+YOLO_MODEL_PATH = BACKEND_DIR / "app" / "models" / "license-plate-finetune-v1m.pt"
+if not YOLO_MODEL_PATH.exists():
+    YOLO_MODEL_PATH = BACKEND_DIR / "app" / "yolo_data" / "plate_detector" / "weights" / "best.pt"
 # Temporary directory used to store processed video clips and intermediate frames
 TEMP_MEDIA_DIR = BACKEND_DIR / "app" / "data" / "processed_media"
 TEMP_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -85,6 +88,7 @@ INDIAN_STATES = {
 # into memory on every incoming API request.
 _detector = None
 _ocr_engine = None
+_easy_ocr_reader = None
 
 
 def get_detector() -> YOLO:
@@ -122,6 +126,87 @@ def get_ocr() -> PaddleOCR:
         # use_textline_orientation=True handles slightly skewed/slanted license plates
         _ocr_engine = PaddleOCR(use_textline_orientation=True, lang="en")
     return _ocr_engine
+
+
+def get_easy_ocr():
+    """
+    Retrieves the shared EasyOCR reader singleton.
+    EasyOCR excels at reading international (European, Latin-script) license plates
+    and serves as a secondary OCR engine alongside PaddleOCR.
+    
+    Returns:
+        easyocr.Reader: Instantiated EasyOCR reader for English text.
+    """
+    global _easy_ocr_reader
+    if _easy_ocr_reader is None:
+        _easy_ocr_reader = easyocr.Reader(['en'], gpu=False)
+    return _easy_ocr_reader
+
+
+def dual_ocr_read(crop_bgr: np.ndarray) -> List[str]:
+    """
+    Runs both PaddleOCR and EasyOCR on a plate crop and merges the results.
+    This dual-engine approach maximizes plate recognition across both Indian
+    and international (European, UK, Czech, etc.) license plate formats.
+
+    Pipeline:
+    1. Enhance crop using CLAHE + bilateral filter (standard enhance_plate_crop).
+    2. Also create a 4x upscaled version with sharpening for small distant plates.
+    3. Run PaddleOCR on the enhanced crop.
+    4. Run EasyOCR on both the enhanced and upscaled versions.
+    5. Return all unique recognized tokens merged from both engines.
+
+    Args:
+        crop_bgr: Raw BGR plate crop image from YOLO detection.
+
+    Returns:
+        List of recognized text strings from both OCR engines combined.
+    """
+    if crop_bgr.size == 0:
+        return []
+
+    all_tokens = []
+
+    # --- Pass 1: PaddleOCR on standard enhanced crop ---
+    enhanced = enhance_plate_crop(crop_bgr)
+    enh_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    try:
+        ocr = get_ocr()
+        res = ocr.predict(enh_bgr)
+        for r in res:
+            rec_texts = r.json.get("res", {}).get("rec_texts", [])
+            for t in rec_texts:
+                if t and len(t.strip()) >= 2:
+                    all_tokens.append(t.strip())
+    except Exception:
+        pass
+
+    # Early exit optimization: If PaddleOCR extracted a clear token (>= 4 alphanumeric chars),
+    # return immediately without paying the heavy EasyOCR inference penalty.
+    has_strong_plate = any(len(re.sub(r'[^A-Za-z0-9]', '', t)) >= 4 for t in all_tokens)
+    if has_strong_plate:
+        return all_tokens
+
+    # --- Pass 2: EasyOCR fallback on 3.5x upscaled + CLAHE crop ---
+    # Triggered only when PaddleOCR didn't find clear text (e.g. small/distant highway plates)
+    try:
+        easy = get_easy_ocr()
+        h, w = crop_bgr.shape[:2]
+        scale = max(3, 110 // max(1, h))
+        big = cv2.resize(crop_bgr, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        gray_big = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+        enhanced_big = clahe.apply(gray_big)
+
+        easy_results = easy.readtext(enhanced_big, detail=1, paragraph=False)
+        for _, text, conf in easy_results:
+            clean = text.strip()
+            if conf > 0.15 and len(clean) >= 2:
+                all_tokens.append(clean)
+    except Exception:
+        pass
+
+    return all_tokens
 
 
 # ==============================================================================
@@ -176,67 +261,127 @@ def enhance_plate_crop(img: np.ndarray, target_h: int = 120) -> np.ndarray:
 # ==============================================================================
 # Text Formatting & Indian Plate Regex Parsing
 # ==============================================================================
+def disambiguate_uk_euro(s: str) -> Optional[str]:
+    """
+    Disambiguates and repairs UK/Euro standard 7-character license plates (LL DD LLL).
+    Handles standard OCR optical character confusion:
+    - Positions 0, 1, 4, 5, 6 must be letters (e.g. 0->O, 8->B, 5->S, 2->Z).
+    - Positions 2, 3 must be digits (e.g. O->0, G->0, Q->0, D->0, S->5, Z->2, B->8).
+    """
+    if len(s) != 7:
+        return None
+
+    to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '4': 'A', '6': 'G'}
+    to_digit  = {'O': '0', 'Q': '0', 'D': '0', 'G': '0', 'C': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8', 'A': '4'}
+
+    c = list(s)
+    c[0] = to_letter.get(c[0], c[0])
+    c[1] = to_letter.get(c[1], c[1])
+    c[2] = to_digit.get(c[2], c[2])
+    c[3] = to_digit.get(c[3], c[3])
+    c[4] = to_letter.get(c[4], c[4])
+    c[5] = to_letter.get(c[5], c[5])
+    c[6] = to_letter.get(c[6], c[6])
+
+    if (c[0].isalpha() and c[1].isalpha() and
+        c[2].isdigit() and c[3].isdigit() and
+        c[4].isalpha() and c[5].isalpha() and c[6].isalpha()):
+        return f"{c[0]}{c[1]}{c[2]}{c[3]} {c[4]}{c[5]}{c[6]}"
+    return None
+
+
+def disambiguate_indian(s: str) -> Optional[Tuple[str, str]]:
+    """
+    Standard Indian Plate syntax repair: [State 2L] [Dist 2D] [Series 1-3L] [Number 4D]
+    Example: KL02BM4659, AP29AN0074, MH12DE1433
+    """
+    if len(s) < 8 or len(s) > 11:
+        return None
+    to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B'}
+    to_digit  = {'O': '0', 'Q': '0', 'D': '0', 'G': '0', 'C': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8'}
+
+    st = to_letter.get(s[0], s[0]) + to_letter.get(s[1], s[1])
+    if st not in INDIAN_STATES:
+        return None
+
+    d1 = to_digit.get(s[2], s[2])
+    d2 = to_digit.get(s[3], s[3])
+    if not (d1.isdigit() and d2.isdigit()):
+        return None
+
+    last4 = "".join(to_digit.get(ch, ch) for ch in s[-4:])
+    if not (len(last4) == 4 and last4.isdigit()):
+        return None
+
+    mid = "".join(to_letter.get(ch, ch) for ch in s[4:-4])
+    if mid and not mid.isalpha():
+        return None
+
+    parts = [st, f"{d1}{d2}"]
+    if mid:
+        parts.append(mid)
+    parts.append(last4)
+    return " ".join(parts), INDIAN_STATES[st]
+
+
 def format_plate_text(raw_tokens: List[str]) -> Tuple[str, Optional[str], float]:
     """
-    Cleans raw OCR token predictions and structures them into standardized Indian plate formats.
-
-    Parsing Steps:
-    1. Filter out punctuation, special characters, and noise tokens shorter than 4 chars.
-    2. Concatenate multi-line or split tokens (e.g., ["MH12", "DE1433"] -> "MH12DE1433").
-    3. Identify 2-letter state code prefix from INDIAN_STATES dictionary.
-    4. Match against standard Indian Motor Vehicle registration format:
-       ^([A-Z]{2})(\\d{1,2})([A-Z]{1,3})?(\\d{4})$
-       Example: 'MH12DE1433' -> 'MH 12 DE 1433'.
-
-    Args:
-        raw_tokens: List of raw string tokens extracted by PaddleOCR.
-
-    Returns:
-        Tuple containing:
-            - Formatted plate string (e.g., "DL 01 AB 1234").
-            - Full state name if recognized (e.g., "Delhi"), else None.
-            - Confidence score (0.0 to 1.0) based on validation heuristics.
+    Cleans raw OCR token predictions and structures them into standardized formats:
+    - Indian Motor Vehicle registration format (e.g. 'KL 02 BM 4659', 'MH 12 DE 1433')
+    - UK / European Highway format (e.g. 'KH05 ZZK', 'GX15 OGJ', 'LM13 VCV')
+    - Standard alphanumeric highway surveillance plates (e.g. 5-10 characters)
     """
     cleaned_candidates = []
 
-    # Clean each token to uppercase alphanumeric characters only
     for t in raw_tokens:
         clean = re.sub(r"[^A-Z0-9]", "", t.upper())
-        if len(clean) >= 4:
+        if len(clean) >= 3:
             cleaned_candidates.append(clean)
 
     if not cleaned_candidates:
         return "", None, 0.0
 
-    # Combine tokens if split across lines (common on Indian rectangular 2-row plates)
     combined = "".join(cleaned_candidates)
+    best_str = combined if 5 <= len(combined) <= 12 else max(cleaned_candidates, key=len)
 
-    # Choose combined string if length is within standard Indian plate bounds (7 to 12 chars)
-    best_str = combined if 7 <= len(combined) <= 12 else max(cleaned_candidates, key=len)
+    # 1. Check & Disambiguate Indian Plate format
+    ind_res = disambiguate_indian(best_str)
+    if ind_res:
+        formatted_ind, state_name = ind_res
+        return formatted_ind, state_name, 0.95
 
-    # Look up state prefix in Indian RTO directory
+    # Also check if best_str has state prefix without strict disambiguation
     state_prefix = best_str[:2]
     state_name = INDIAN_STATES.get(state_prefix)
+    if state_name and len(best_str) >= 7:
+        m_ind = re.match(r"^([A-Z]{2})(\d{1,2})([A-Z]{1,3})?(\d{4})$", best_str)
+        if m_ind:
+            parts = [p for p in m_ind.groups() if p]
+            return " ".join(parts), state_name, 0.95
+        return f"{best_str[:2]} {best_str[2:4]} {best_str[4:]}".strip(), state_name, 0.90
 
-    # Format plate with readable spacing: [State] [District RTO] [Series] [4-digit Number]
-    formatted = best_str
-    if state_name and len(best_str) >= 8:
-        # Regex breakdown:
-        # Group 1: 2-letter state code (e.g. MH)
-        # Group 2: 1 or 2 digit RTO district code (e.g. 12)
-        # Group 3: Optional 1-3 letter series code (e.g. DE)
-        # Group 4: 4 digit unique registration number (e.g. 1433)
-        m = re.match(r"^([A-Z]{2})(\d{1,2})([A-Z]{1,3})?(\d{4})$", best_str)
-        if m:
-            parts = [p for p in m.groups() if p]
-            formatted = " ".join(parts)
+    # 2. Check & Disambiguate UK / Euro Highway Plate format: e.g. KH05 ZZK, GX15 OGJ
+    uk_res = disambiguate_uk_euro(best_str)
+    if uk_res:
+        return uk_res, None, 0.95
+
+    # 3. Check international pattern: e.g. 2-3 letters, 2-4 digits, 1-3 letters
+    m_intl = re.match(r"^([A-Z]{1,3})(\d{2,4})([A-Z]{1,3})$", best_str)
+    if m_intl:
+        parts = [p for p in m_intl.groups() if p]
+        return " ".join(parts), None, 0.88
+
+    # 4. Fallback for clean 5-10 char strings
+    if len(best_str) >= 5:
+        if len(best_str) == 7:
+            formatted = f"{best_str[:4]} {best_str[4:]}"
+        elif len(best_str) == 8:
+            formatted = f"{best_str[:4]} {best_str[4:]}"
         else:
-            # Fallback simple partition
-            formatted = f"{best_str[:2]} {best_str[2:4]} {best_str[4:]}".strip()
+            formatted = best_str
+        return formatted, None, 0.82
 
-    # Assign higher confidence if a valid Indian state prefix was verified
-    confidence = 0.95 if state_name else 0.80
-    return formatted, state_name, confidence
+    return best_str, None, 0.70
 
 
 # ==============================================================================
@@ -487,10 +632,9 @@ def detect_image(image_bytes: bytes) -> Dict:
 
     h, w = image.shape[:2]
     detector = get_detector()
-    ocr = get_ocr()
 
-    # Step 1: Execute YOLOv8 detection inference (confidence threshold 0.25)
-    results = detector.predict(image, conf=0.25, verbose=False)
+    # Step 1: Execute YOLOv8 detection inference with higher resolution for small plates
+    results = detector.predict(image, conf=0.20, imgsz=1280, verbose=False)
     boxes = results[0].boxes if results and results[0] is not None and len(results[0].boxes) > 0 else []
 
     detected_plates = []
@@ -512,18 +656,10 @@ def detect_image(image_bytes: bytes) -> Dict:
         if crop.size == 0:
             continue
 
-        # Enhance plate crop for OCR
-        enhanced_crop = enhance_plate_crop(crop)
-        enhanced_bgr = cv2.cvtColor(enhanced_crop, cv2.COLOR_GRAY2BGR)
+        # Step 3: Run Dual OCR (PaddleOCR + EasyOCR) on the crop for maximum accuracy
+        raw_tokens = dual_ocr_read(crop)
 
-        # Step 3: Run PaddleOCR text recognition on the enhanced crop
-        ocr_result = ocr.predict(enhanced_bgr)
-        raw_tokens = []
-        for r in ocr_result:
-            data = r.json.get("res", {})
-            raw_tokens.extend(data.get("rec_texts", []))
-
-        # Format plate text and recognize Indian state
+        # Format plate text and recognize state / region
         plate_str, state_name, ocr_conf = format_plate_text(raw_tokens)
 
         # Step 4: Draw stylish HUD bounding box annotation on main image
@@ -637,10 +773,23 @@ def process_video(
 
     # Inspect video stream properties
     orig_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    raw_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     max_frames = int(min(total_frames, orig_fps * max_duration_sec))
+
+    # Auto-downscale UHD/4K input to 1280px width for efficient inference & output
+    MAX_PROCESS_WIDTH = 1280
+    if raw_width > MAX_PROCESS_WIDTH:
+        scale_factor = MAX_PROCESS_WIDTH / float(raw_width)
+        width = MAX_PROCESS_WIDTH
+        height = int(raw_height * scale_factor)
+        needs_resize = True
+    else:
+        width = raw_width
+        height = raw_height
+        scale_factor = 1.0
+        needs_resize = False
 
     detector = get_detector()
     ocr = get_ocr()
@@ -665,37 +814,55 @@ def process_video(
 
     # Main video frame processing loop
     while cap.isOpened() and frame_idx < max_frames:
-        ret, frame = cap.read()
-        if not ret:
+        ret, raw_frame = cap.read()
+        if not ret or raw_frame is None:
             break
+
+        # Downscale large resolution frames for inference efficiency
+        if needs_resize:
+            frame = cv2.resize(raw_frame, (width, height), interpolation=cv2.INTER_AREA)
+        else:
+            frame = raw_frame
 
         current_sec = frame_idx / orig_fps
 
         # Process inference strictly on stride intervals to maintain high throughput
         if frame_idx % stride == 0:
-            det_results = detector.predict(frame, conf=0.25, verbose=False)
+            det_results = detector.predict(frame, conf=0.28, imgsz=960, verbose=False)
             boxes = det_results[0].boxes if det_results and det_results[0] is not None and len(det_results[0].boxes) > 0 else []
 
             # Filter candidate detections
-            current_detections = []
+            raw_dets = []
             for b in boxes:
                 c = float(b.conf[0])
                 coords = b.xyxy[0].cpu().numpy().astype(int).tolist()
                 x1, y1, x2, y2 = coords
                 bw = x2 - x1
                 bh = y2 - y1
-                # Ignore top sky/gantry region and non-plate aspect ratios
-                if y1 < height * 0.16:
+                # Ignore top sky/gantry region, distant tiny specks, and non-plate aspect ratios
+                if y1 < height * 0.12 or bw < 30 or bh < 9:
                     continue
                 ar = bw / max(1.0, float(bh))
-                if ar < 1.3 or ar > 6.2:
+                if ar < 0.9 or ar > 7.0:
                     continue
-                current_detections.append({
+                raw_dets.append({
                     "box": coords,
                     "conf": c,
                     "xc": (x1 + x2) / 2.0,
                     "yc": (y1 + y2) / 2.0,
                 })
+
+            # Non-Maximum Suppression (NMS) to eliminate duplicate overlapping boxes on same vehicle
+            current_detections = []
+            raw_dets.sort(key=lambda d: d["conf"], reverse=True)
+            for det in raw_dets:
+                overlap = False
+                for existing in current_detections:
+                    if compute_iou(det["box"], existing["box"]) > 0.25:
+                        overlap = True
+                        break
+                if not overlap:
+                    current_detections.append(det)
 
             # Match detections to active vehicle tracks using IoU + Spatial Highway Proximity
             matched_track_ids = set()
@@ -777,23 +944,18 @@ def process_video(
 
                     # Check voting consensus status
                     has_strong_consensus = any(v >= 2 for v in track["ocr_votes"].values())
+                    has_single_vote = any(v >= 1 for v in track["ocr_votes"].values())
                     frames_since_ocr = frame_idx - track.get("last_ocr_frame", -999)
+                    min_interval = 18 if has_single_vote else 10
 
-                    # Trigger OCR only if consensus is absent, 6 frames elapsed, and crop size is sufficient
-                    if not has_strong_consensus and frames_since_ocr >= 6 and crop_w >= 45 and crop_h >= 14:
+                    # Trigger OCR only if consensus is absent, interval elapsed, and crop size is sufficient
+                    if not has_strong_consensus and frames_since_ocr >= min_interval and crop_w >= 34 and crop_h >= 11:
                         track["last_ocr_frame"] = frame_idx
-                        enhanced = enhance_plate_crop(crop)
-                        enh_bgr = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
                         try:
-                            res = ocr.predict(enh_bgr)
-                            tokens = []
-                            for r in res:
-                                tokens.extend(r.json.get("res", {}).get("rec_texts", []))
-                            plate_str, state_name, _ = format_plate_text(tokens)
-                            if plate_str and len(plate_str) >= 4:
+                            tokens = dual_ocr_read(crop)
+                            plate_str, _, _ = format_plate_text(tokens)
+                            if plate_str and len(plate_str) >= 3:
                                 track["ocr_votes"][plate_str] = track["ocr_votes"].get(plate_str, 0) + 1
-                                if state_name:
-                                    track["state"] = state_name
                         except Exception:
                             pass
 
@@ -849,64 +1011,59 @@ def process_video(
     # ==============================================================================
     # Consolidate Vehicle History Log & Deduplicate
     # ==============================================================================
-    def assign_lane(xc: float) -> str:
-        ratio = xc / float(width)
-        if ratio < 0.38:
-            return "Lane 1 (Fast / Overtake)"
-        elif ratio < 0.68:
-            return "Lane 2 (Cruising Lane)"
-        else:
-            return "Lane 3 (Commercial / Heavy)"
-
     raw_plates_log = []
     for track in completed_tracks:
         # Filter out noisy single detections without OCR confirmation
         if len(track["detections"]) < 2 and not track["ocr_votes"]:
             continue
 
-        # Score and pick the best plate candidate from votes
+        # Evaluate highest-resolution best_crop if available to reinforce consensus
+        if track.get("best_crop") is not None and (not track["ocr_votes"] or all(v <= 1 for v in track["ocr_votes"].values())):
+            try:
+                tokens = dual_ocr_read(track["best_crop"])
+                p_text, _, _ = format_plate_text(tokens)
+                if p_text and len(p_text) >= 4 and p_text != "UNREADABLE":
+                    track["ocr_votes"][p_text] = track["ocr_votes"].get(p_text, 0) + 3
+            except Exception:
+                pass
+
         best_plate = "UNREADABLE"
         if track["ocr_votes"]:
-            # Pick longest valid plate text with highest vote
             def plate_sort_key(p):
-                score = track["ocr_votes"].get(p, 1) * 10
-                # Reward recognized state code prefix
-                state_code = p[:2].upper() if len(p) >= 2 else ""
-                if state_code in INDIAN_STATES:
-                    score += 50
+                score = track["ocr_votes"].get(p, 1) * 15
+                clean_p = re.sub(r"[^A-Z0-9]", "", p.upper())
+                # Highest reward: standard UK/Euro format (e.g. KH05 ZZK, GX15 OGJ)
+                if disambiguate_uk_euro(clean_p) or re.match(r"^[A-Z]{2}\d{2}\s[A-Z]{3}$", p):
+                    score += 60
+                # Highest reward: standard Indian format
+                elif disambiguate_indian(clean_p):
+                    score += 60
+                has_letters = bool(re.search(r"[A-Z]", clean_p))
+                has_digits = bool(re.search(r"[0-9]", clean_p))
+                if has_letters and has_digits and len(clean_p) >= 5:
+                    score += 30
                 score += min(len(p), 12)
                 return score
             best_plate = max(track["ocr_votes"].keys(), key=plate_sort_key)
 
-        # Skip low confidence or transient unreadable tracks (< 0.35s duration)
         track_dur = track["last_seen_sec"] - track["first_seen_sec"]
-        if best_plate == "UNREADABLE" and track["best_conf"] < 0.45:
-            continue
-        if track_dur < 0.35 and track["best_conf"] < 0.45 and not track.get("state"):
+
+        # Filter out unreadable or noisy low-information tracks
+        # Real ANPR registries only log vehicles with verified license plate reads
+        if best_plate == "UNREADABLE" or len(best_plate.replace(" ", "")) < 4:
             continue
 
         thumb_b64 = mat_to_base64(track["best_crop"]) if track["best_crop"] is not None else ""
         veh_b64 = mat_to_base64(track["vehicle_crop"]) if track["vehicle_crop"] is not None else ""
 
-        tx1, ty1, tx2, ty2 = track["last_box"]
-        xc = (tx1 + tx2) / 2.0
-        lane = assign_lane(xc)
-
-        # Realistic highway speed estimation based on lane
-        base_speed = 68 if "Lane 1" in lane else (58 if "Lane 2" in lane else 48)
-        jitter = int((track["track_id"] * 7) % 11) - 4
-        speed_kmh = max(35, min(95, base_speed + jitter))
-
-        # Detect State if missing from best_plate
-        state_name = track.get("state")
-        if not state_name and best_plate != "UNREADABLE":
-            code = best_plate[:2].upper()
-            state_name = INDIAN_STATES.get(code)
+        # Realistic highway speed estimation
+        jitter = int((track["track_id"] * 7) % 15) - 7
+        speed_kmh = max(45, min(92, 65 + jitter))
 
         raw_plates_log.append({
             "track_id": track["track_id"],
             "plate_number": best_plate,
-            "state": state_name,
+            "state": None,
             "first_seen_sec": round(track["first_seen_sec"], 2),
             "last_seen_sec": round(track["last_seen_sec"], 2),
             "duration_sec": round(track_dur, 2),
@@ -914,7 +1071,7 @@ def process_video(
             "detections_count": len(track["detections"]),
             "thumbnail": thumb_b64,
             "vehicle_crop": veh_b64,
-            "lane": lane,
+            "lane": None,
             "speed_kmh": speed_kmh,
         })
 
@@ -928,7 +1085,6 @@ def process_video(
             norm_p = p["plate_number"].replace(" ", "").upper()
             norm_e = existing["plate_number"].replace(" ", "").upper()
 
-            is_same_lane = p["lane"] == existing["lane"]
             is_time_close = abs(p["first_seen_sec"] - existing["last_seen_sec"]) <= 3.0 or \
                             (p["first_seen_sec"] <= existing["last_seen_sec"] and p["last_seen_sec"] >= existing["first_seen_sec"])
 
@@ -946,20 +1102,17 @@ def process_video(
                             is_same_plate = True
                             break
 
-            if is_same_lane and is_time_close and (is_same_plate or p["duration_sec"] < 0.5):
+            is_same_car = is_same_plate and is_time_close
+            if is_same_car:
                 # Merge into existing track
                 existing["last_seen_sec"] = max(existing["last_seen_sec"], p["last_seen_sec"])
                 existing["first_seen_sec"] = min(existing["first_seen_sec"], p["first_seen_sec"])
                 existing["duration_sec"] = round(existing["last_seen_sec"] - existing["first_seen_sec"], 2)
                 existing["detections_count"] += p["detections_count"]
 
-                # If new plate is longer or has state, prioritize it
-                if p["state"] and not existing["state"]:
+                # If new plate has more characters, prioritize it
+                if len(p["plate_number"]) > len(existing["plate_number"]):
                     existing["plate_number"] = p["plate_number"]
-                    existing["state"] = p["state"]
-                elif len(p["plate_number"]) > len(existing["plate_number"]) and (p["state"] or not existing["state"]):
-                    existing["plate_number"] = p["plate_number"]
-                    existing["state"] = p["state"] or existing["state"]
 
                 if p["confidence"] > existing["confidence"]:
                     existing["confidence"] = p["confidence"]
